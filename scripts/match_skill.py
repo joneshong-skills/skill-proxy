@@ -8,7 +8,7 @@ Usage:
     match_skill.py --hot          # list current hot skills
     match_skill.py --stats        # show hot/cold breakdown
 
-Scoring layers:
+Scoring layers (BM25):
   1. Exact trigger phrase match:    +10
   2. Trigger substring match:       +5
   3. Name match (exact/contains):   +8 / +5
@@ -22,6 +22,7 @@ Scoring layers:
   11. CJK overlap on description:   up to +3
   12. Alias expansion:              injects synthetic tokens
   13. Intent signals:               +6 per match
+  14. Embedding similarity:         up to +12 (qwen3-embedding via Ollama)
 """
 
 from __future__ import annotations
@@ -33,6 +34,13 @@ from pathlib import Path
 
 TRIGGERS_PATH = Path.home() / ".claude/data/skill-index/triggers.json"
 HOT_SKILLS_PATH = Path.home() / ".claude/data/skill-index/hot-skills.json"
+EMBEDDINGS_CACHE_PATH = Path.home() / ".claude/data/skill-index/embeddings-cache.json"
+OLLAMA_URL = "http://localhost:11434/api/embed"
+EMBED_MODEL = "qwen3-embedding:0.6b"
+
+# Embedding scoring config
+EMBED_WEIGHT = 12.0  # max score contribution from embedding similarity
+EMBED_THRESHOLD = 0.45  # minimum cosine similarity to contribute score
 
 # ── Alias expansion: abbreviations/synonyms → canonical skill names ──
 # When a query token matches an alias key, the alias values are injected
@@ -173,6 +181,46 @@ def load_hot_skills() -> list[str]:
     if HOT_SKILLS_PATH.exists():
         return json.loads(HOT_SKILLS_PATH.read_text())
     return []
+
+
+# ── Embedding helpers ──
+
+_embed_cache: dict | None = None
+
+
+def load_embeddings() -> dict[str, list[float]]:
+    """Load pre-computed skill embeddings from cache."""
+    global _embed_cache
+    if _embed_cache is not None:
+        return _embed_cache
+    if EMBEDDINGS_CACHE_PATH.exists():
+        data = json.loads(EMBEDDINGS_CACHE_PATH.read_text())
+        _embed_cache = data.get("skills", {})
+    else:
+        _embed_cache = {}
+    return _embed_cache
+
+
+def embed_query(text: str) -> list[float] | None:
+    """Embed query text via Ollama. Returns None on failure."""
+    try:
+        req = urllib.request.Request(
+            OLLAMA_URL,
+            data=json.dumps({"model": EMBED_MODEL, "input": text}).encode(),
+            headers={"Content-Type": "application/json"},
+        )
+        resp = urllib.request.urlopen(req, timeout=5)
+        return json.loads(resp.read())["embeddings"][0]
+    except Exception:
+        return None
+
+
+def cosine_sim(a: list[float], b: list[float]) -> float:
+    """Fast cosine similarity."""
+    dot = sum(x * y for x, y in zip(a, b))
+    na = math.sqrt(sum(x * x for x in a))
+    nb = math.sqrt(sum(x * x for x in b))
+    return dot / (na * nb) if na and nb else 0.0
 
 
 CJK_RE = re.compile(r"[\u4e00-\u9fff\u3400-\u4dbf]")
@@ -331,25 +379,48 @@ def score_skill(skill: dict, query: str, query_tokens: list[str]) -> float:
     return round(score, 1)
 
 
-def match(query: str, top_n: int = 3, cold_only: bool = False) -> list[dict]:
+def match(
+    query: str, top_n: int = 3, cold_only: bool = False, no_embed: bool = False
+) -> list[dict]:
     index = load_index()
     hot_skills = load_hot_skills()
     tokens = tokenize(query)
 
+    # Embedding: compute query vector once, then score all skills
+    embed_scores: dict[str, float] = {}
+    if not no_embed:
+        skill_embeds = load_embeddings()
+        if skill_embeds:
+            q_vec = embed_query(query)
+            if q_vec:
+                for name, s_vec in skill_embeds.items():
+                    sim = cosine_sim(q_vec, s_vec)
+                    if sim >= EMBED_THRESHOLD:
+                        embed_scores[name] = round(
+                            (sim - EMBED_THRESHOLD)
+                            / (1.0 - EMBED_THRESHOLD)
+                            * EMBED_WEIGHT,
+                            1,
+                        )
+
     results = []
     for skill in index:
-        if cold_only and skill["name"] in hot_skills:
+        name = skill["name"]
+        if cold_only and name in hot_skills:
             continue
-        s = score_skill(skill, query, tokens)
-        if s > 0:
-            results.append(
-                {
-                    "name": skill["name"],
-                    "score": s,
-                    "description": skill.get("description", "")[:150],
-                    "is_hot": skill["name"] in hot_skills,
-                }
-            )
+        bm25 = score_skill(skill, query, tokens)
+        emb = embed_scores.get(name, 0.0)
+        total = round(bm25 + emb, 1)
+        if total > 0:
+            entry = {
+                "name": name,
+                "score": total,
+                "description": skill.get("description", "")[:150],
+                "is_hot": name in hot_skills,
+            }
+            if emb > 0:
+                entry["embed_boost"] = emb
+            results.append(entry)
 
     results.sort(key=lambda x: -x["score"])
     return results[:top_n]
@@ -388,12 +459,14 @@ def main():
         top_n = int(args[idx + 1])
         args = [a for i, a in enumerate(args) if i != idx and i != idx + 1]
 
+    no_embed = "--no-embed" in args
+
     query = " ".join(a for a in args if not a.startswith("--"))
     if not query:
         print("Error: no query provided", file=sys.stderr)
         sys.exit(1)
 
-    results = match(query, top_n=top_n)
+    results = match(query, top_n=top_n, no_embed=no_embed)
 
     if not results:
         print(json.dumps({"matches": [], "query": query}))
