@@ -60,6 +60,21 @@ ALIASES = {
     "diagram": ["diagram-gen"],
     "flowchart": ["diagram-gen"],
     "mermaid": ["diagram-gen"],
+    # Frontend
+    "landing": ["frontend-design"],
+    "page": ["frontend-design"],
+    "website": ["frontend-design"],
+    "網頁": ["frontend-design"],
+    "前端": ["frontend-design"],
+    # MCP
+    "mcp": ["mcp-builder"],
+    # Video
+    "剪": ["video-edit"],
+    "剪輯": ["video-edit"],
+    "影片": ["video-edit", "video-core"],
+    "video": ["video-edit", "video-core"],
+    # readme
+    "readme": ["readme-gen"],
 }
 
 # ── Intent signals: Chinese/English action phrases → skill boosts ──
@@ -119,6 +134,28 @@ INTENT_SIGNALS = [
     ("deploy", ["sentinel"], 3),
     ("uptime", ["sentinel"], 4),
     ("服務", ["sentinel"], 3),
+    # Frontend / landing page
+    ("landing page", ["frontend-design"], 8),
+    ("做網頁", ["frontend-design"], 6),
+    ("做網站", ["frontend-design"], 6),
+    ("build a website", ["frontend-design"], 6),
+    ("dashboard", ["frontend-design"], 4),
+    # MCP server building
+    ("mcp server", ["mcp-builder"], 8),
+    ("mcp tool", ["mcp-builder"], 6),
+    ("寫個mcp", ["mcp-builder"], 8),
+    ("build mcp", ["mcp-builder"], 6),
+    # README
+    ("readme", ["readme-gen"], 8),
+    ("寫readme", ["readme-gen"], 8),
+    ("write readme", ["readme-gen"], 8),
+    ("generate readme", ["readme-gen"], 6),
+    # Video editing
+    ("剪影片", ["video-edit"], 6),
+    ("剪一下", ["video-edit"], 6),
+    ("edit video", ["video-edit"], 6),
+    ("trim video", ["video-edit"], 6),
+    ("影片剪", ["video-edit"], 6),
 ]
 
 # ── CJK noise: common words that pollute matching ──
