@@ -5,35 +5,96 @@ Build embedding cache for skill-proxy semantic matching.
 Reads triggers.json, computes embeddings for each skill's combined text
 (name + description + triggers), and saves to embeddings-cache.json.
 
+Uses oMLX bridge (Qwen3-Embedding-0.6B via persistent subprocess worker).
+
 Usage:
-    build_embeddings.py                     # build with qwen3-embedding:0.6b
-    build_embeddings.py --model nomic-embed-text  # use different model
+    build_embeddings.py                     # build cache
     build_embeddings.py --check             # verify cache freshness
 """
 
 from __future__ import annotations
 
 import json
+import subprocess
 import sys
 import time
-import urllib.request
 from pathlib import Path
 
 TRIGGERS_PATH = Path.home() / ".claude/data/skill-index/triggers.json"
 CACHE_PATH = Path.home() / ".claude/data/skill-index/embeddings-cache.json"
-DEFAULT_MODEL = "qwen3-embedding:0.6b"
-OLLAMA_URL = "http://localhost:11434/api/embed"
-BATCH_SIZE = 10  # embed N skills per API call
+OMLX_PYTHON = Path.home() / ".venvs/omlx/bin/python3"
+OMLX_WORKER = Path.home() / ".venvs/omlx/embed_worker.py"
+BATCH_SIZE = 10  # embed N skills per request
+
+_omlx_proc: subprocess.Popen | None = None
 
 
-def embed_batch(texts: list[str], model: str = DEFAULT_MODEL) -> list[list[float]]:
-    req = urllib.request.Request(
-        OLLAMA_URL,
-        data=json.dumps({"model": model, "input": texts}).encode(),
-        headers={"Content-Type": "application/json"},
-    )
-    resp = urllib.request.urlopen(req, timeout=30)
-    return json.loads(resp.read())["embeddings"]
+def _ensure_omlx() -> bool:
+    """Start oMLX worker subprocess if not running."""
+    global _omlx_proc
+    if _omlx_proc is not None and _omlx_proc.poll() is None:
+        return True
+    if not OMLX_PYTHON.exists() or not OMLX_WORKER.exists():
+        print(f"Error: oMLX venv not found at {OMLX_PYTHON}", file=sys.stderr)
+        return False
+    try:
+        _omlx_proc = subprocess.Popen(
+            [str(OMLX_PYTHON), str(OMLX_WORKER)],
+            stdin=subprocess.PIPE,
+            stdout=subprocess.PIPE,
+            stderr=subprocess.PIPE,
+            text=True,
+            bufsize=1,
+        )
+        line = _omlx_proc.stdout.readline()
+        if not line:
+            _omlx_proc.kill()
+            _omlx_proc = None
+            return False
+        status = json.loads(line.strip())
+        if status.get("status") == "ready":
+            print(f"oMLX worker ready: {status.get('model')}")
+            return True
+        _omlx_proc.kill()
+        _omlx_proc = None
+        return False
+    except Exception as e:
+        print(f"Failed to start oMLX worker: {e}", file=sys.stderr)
+        if _omlx_proc:
+            try:
+                _omlx_proc.kill()
+            except ProcessLookupError:
+                pass
+        _omlx_proc = None
+        return False
+
+
+def _shutdown_omlx():
+    """Gracefully shutdown the worker."""
+    global _omlx_proc
+    if _omlx_proc and _omlx_proc.poll() is None:
+        try:
+            _omlx_proc.stdin.close()
+            _omlx_proc.wait(timeout=5)
+        except Exception:
+            _omlx_proc.kill()
+    _omlx_proc = None
+
+
+def embed_batch(texts: list[str]) -> list[list[float]]:
+    """Embed a batch of texts via oMLX bridge."""
+    if not _ensure_omlx():
+        raise RuntimeError("oMLX worker not available")
+    req = {"texts": texts, "task_type": "search_document"}
+    _omlx_proc.stdin.write(json.dumps(req) + "\n")
+    _omlx_proc.stdin.flush()
+    line = _omlx_proc.stdout.readline()
+    if not line:
+        raise RuntimeError("oMLX worker returned empty response")
+    resp = json.loads(line.strip())
+    if "error" in resp:
+        raise RuntimeError(f"oMLX embedding error: {resp['error']}")
+    return resp.get("embeddings", [])
 
 
 def skill_text(skill: dict) -> str:
@@ -48,15 +109,15 @@ def skill_text(skill: dict) -> str:
     return " ".join(parts)
 
 
-def build_cache(model: str = DEFAULT_MODEL) -> dict:
+def build_cache() -> dict:
     if not TRIGGERS_PATH.exists():
         print(f"Error: {TRIGGERS_PATH} not found", file=sys.stderr)
         sys.exit(1)
 
     index = json.loads(TRIGGERS_PATH.read_text())
-    print(f"Building embeddings for {len(index)} skills with {model}...")
+    print(f"Building embeddings for {len(index)} skills via oMLX...")
 
-    cache = {"model": model, "version": 1, "skills": {}}
+    cache = {"model": "Qwen3-Embedding-0.6B-oMLX", "version": 2, "skills": {}}
     texts = []
     names = []
 
@@ -71,7 +132,7 @@ def build_cache(model: str = DEFAULT_MODEL) -> dict:
     for i in range(0, len(texts), BATCH_SIZE):
         batch_texts = texts[i : i + BATCH_SIZE]
         batch_names = names[i : i + BATCH_SIZE]
-        embeddings = embed_batch(batch_texts, model)
+        embeddings = embed_batch(batch_texts)
         for name, emb in zip(batch_names, embeddings):
             cache["skills"][name] = emb
         done = min(i + BATCH_SIZE, len(texts))
@@ -84,6 +145,8 @@ def build_cache(model: str = DEFAULT_MODEL) -> dict:
     CACHE_PATH.write_text(json.dumps(cache))
     size_mb = CACHE_PATH.stat().st_size / 1024 / 1024
     print(f"Saved to {CACHE_PATH} ({size_mb:.1f} MB)")
+
+    _shutdown_omlx()
     return cache
 
 
@@ -113,17 +176,12 @@ def check_freshness():
 
 def main():
     args = sys.argv[1:]
-    model = DEFAULT_MODEL
 
     if "--check" in args:
         check_freshness()
         return
 
-    if "--model" in args:
-        idx = args.index("--model")
-        model = args[idx + 1]
-
-    build_cache(model)
+    build_cache()
 
 
 if __name__ == "__main__":

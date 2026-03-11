@@ -4,13 +4,13 @@ Skill Proxy — hybrid BM25 + embedding skill matching with score-weighted fusio
 
 Architecture (adapted from workshop/qdrant hybrid search):
   Phase 1: BM25 keyword scoring (aliases, intent signals, CJK bigrams)
-  Phase 2: Embedding similarity (qwen3-embedding:0.6b via Ollama)
+  Phase 2: Embedding similarity (Qwen3-Embedding-0.6B via oMLX bridge)
   Phase 3: Score-weighted fusion — normalized BM25 + embedding sim with dynamic alpha
 
 Usage:
     match_skill.py "user query here"
     match_skill.py --top 5 "create a diagram"
-    match_skill.py --no-embed "query"     # BM25 only (skip Ollama)
+    match_skill.py --no-embed "query"     # BM25 only (skip oMLX)
     match_skill.py --hot                  # list current hot skills
     match_skill.py --stats                # show hot/cold breakdown
 
@@ -40,15 +40,17 @@ from __future__ import annotations
 import json
 import math
 import re
+import subprocess
 import sys
-import urllib.request
 from pathlib import Path
 
 TRIGGERS_PATH = Path.home() / ".claude/data/skill-index/triggers.json"
 HOT_SKILLS_PATH = Path.home() / ".claude/data/skill-index/hot-skills.json"
 EMBEDDINGS_CACHE_PATH = Path.home() / ".claude/data/skill-index/embeddings-cache.json"
-OLLAMA_URL = "http://localhost:11434/api/embed"
-EMBED_MODEL = "qwen3-embedding:0.6b"
+
+# oMLX embedding bridge (Qwen3-Embedding-0.6B via persistent subprocess)
+OMLX_PYTHON = Path.home() / ".venvs/omlx/bin/python3"
+OMLX_WORKER = Path.home() / ".venvs/omlx/embed_worker.py"
 
 # Embedding config
 EMBED_THRESHOLD = 0.45  # minimum cosine similarity to contribute
@@ -276,9 +278,43 @@ def load_hot_skills() -> list[str]:
     return []
 
 
-# ── Embedding helpers ──
+# ── Embedding helpers (oMLX subprocess bridge) ──
 
 _embed_cache: dict | None = None
+_omlx_proc: subprocess.Popen | None = None
+
+
+def _ensure_omlx() -> bool:
+    """Start oMLX worker subprocess if not running."""
+    global _omlx_proc
+    if _omlx_proc is not None and _omlx_proc.poll() is None:
+        return True
+    if not OMLX_PYTHON.exists() or not OMLX_WORKER.exists():
+        return False
+    try:
+        _omlx_proc = subprocess.Popen(
+            [str(OMLX_PYTHON), str(OMLX_WORKER)],
+            stdin=subprocess.PIPE,
+            stdout=subprocess.PIPE,
+            stderr=subprocess.PIPE,
+            text=True,
+            bufsize=1,
+        )
+        line = _omlx_proc.stdout.readline()
+        if not line:
+            _omlx_proc.kill()
+            _omlx_proc = None
+            return False
+        status = json.loads(line.strip())
+        return status.get("status") == "ready"
+    except Exception:
+        if _omlx_proc:
+            try:
+                _omlx_proc.kill()
+            except ProcessLookupError:
+                pass
+        _omlx_proc = None
+        return False
 
 
 def load_embeddings() -> dict[str, list[float]]:
@@ -295,15 +331,21 @@ def load_embeddings() -> dict[str, list[float]]:
 
 
 def embed_query(text: str) -> list[float] | None:
-    """Embed query text via Ollama. Returns None on failure."""
+    """Embed query text via oMLX bridge. Returns None on failure."""
+    if not _ensure_omlx():
+        return None
     try:
-        req = urllib.request.Request(
-            OLLAMA_URL,
-            data=json.dumps({"model": EMBED_MODEL, "input": text}).encode(),
-            headers={"Content-Type": "application/json"},
-        )
-        resp = urllib.request.urlopen(req, timeout=5)
-        return json.loads(resp.read())["embeddings"][0]
+        req = {"texts": [text], "task_type": "search_query"}
+        _omlx_proc.stdin.write(json.dumps(req) + "\n")
+        _omlx_proc.stdin.flush()
+        line = _omlx_proc.stdout.readline()
+        if not line:
+            return None
+        resp = json.loads(line.strip())
+        if "error" in resp:
+            return None
+        embeddings = resp.get("embeddings", [])
+        return embeddings[0] if embeddings else None
     except Exception:
         return None
 
