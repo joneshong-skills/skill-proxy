@@ -1,14 +1,20 @@
 #!/usr/bin/env python3
 """
-Skill Proxy — query-based skill matching against triggers.json index.
+Skill Proxy — hybrid BM25 + embedding skill matching with score-weighted fusion.
+
+Architecture (adapted from workshop/qdrant hybrid search):
+  Phase 1: BM25 keyword scoring (aliases, intent signals, CJK bigrams)
+  Phase 2: Embedding similarity (qwen3-embedding:0.6b via Ollama)
+  Phase 3: Score-weighted fusion — normalized BM25 + embedding sim with dynamic alpha
 
 Usage:
     match_skill.py "user query here"
     match_skill.py --top 5 "create a diagram"
-    match_skill.py --hot          # list current hot skills
-    match_skill.py --stats        # show hot/cold breakdown
+    match_skill.py --no-embed "query"     # BM25 only (skip Ollama)
+    match_skill.py --hot                  # list current hot skills
+    match_skill.py --stats                # show hot/cold breakdown
 
-Scoring layers (BM25):
+BM25 scoring layers:
   1. Exact trigger phrase match:    +10
   2. Trigger substring match:       +5
   3. Name match (exact/contains):   +8 / +5
@@ -21,15 +27,21 @@ Scoring layers (BM25):
   10. CJK overlap on triggers:      up to +6
   11. CJK overlap on description:   up to +3
   12. Alias expansion:              injects synthetic tokens
-  13. Intent signals:               +6 per match
-  14. Embedding similarity:         up to +12 (qwen3-embedding via Ollama)
+  13. Intent signals:               +6~10 per match
+
+Embedding layer:
+  14. Cosine similarity via pre-computed cache + live query embedding
+  Score-weighted fusion combines normalized BM25 + embedding similarity.
+  Dynamic alpha: high BM25 confidence → trust BM25 more; low → lean on embedding.
 """
 
 from __future__ import annotations
 
 import json
+import math
 import re
 import sys
+import urllib.request
 from pathlib import Path
 
 TRIGGERS_PATH = Path.home() / ".claude/data/skill-index/triggers.json"
@@ -38,17 +50,23 @@ EMBEDDINGS_CACHE_PATH = Path.home() / ".claude/data/skill-index/embeddings-cache
 OLLAMA_URL = "http://localhost:11434/api/embed"
 EMBED_MODEL = "qwen3-embedding:0.6b"
 
-# Embedding scoring config
-EMBED_WEIGHT = 12.0  # max score contribution from embedding similarity
-EMBED_THRESHOLD = 0.45  # minimum cosine similarity to contribute score
+# Embedding config
+EMBED_THRESHOLD = 0.45  # minimum cosine similarity to contribute
+
+# Score-weighted fusion config (adapted from workshop/qdrant RRF pattern)
+# Dynamic alpha: high BM25 confidence → trust BM25 more; low → lean on embedding
+FUSION_ALPHA_HIGH = 0.8  # alpha when max_bm25 >= 20 (strong intent signal match)
+FUSION_ALPHA_MED = 0.6  # alpha when max_bm25 >= 10
+FUSION_ALPHA_LOW = 0.4  # alpha when max_bm25 < 10 (ambiguous, rely on embedding)
 
 # ── Alias expansion: abbreviations/synonyms → canonical skill names ──
-# When a query token matches an alias key, the alias values are injected
-# as synthetic tokens, giving the target skill a strong name-match boost.
 ALIASES = {
     # Format abbreviations
     "ppt": ["pptx"],
     "簡報": ["pptx", "presentation"],
+    "投影片": ["pptx"],
+    "slide": ["pptx"],
+    "slides": ["pptx"],
     "doc": ["docx"],
     "xls": ["xlsx"],
     "試算表": ["xlsx"],
@@ -76,6 +94,10 @@ ALIASES = {
     "前端": ["frontend-design"],
     # MCP
     "mcp": ["mcp-builder"],
+    # Document formats
+    "word": ["docx"],
+    "excel": ["xlsx"],
+    "報表": ["xlsx"],
     # Video
     "剪": ["video-edit"],
     "剪輯": ["video-edit"],
@@ -83,11 +105,18 @@ ALIASES = {
     "video": ["video-edit", "video-core"],
     # readme
     "readme": ["readme-gen"],
+    # GitHub
+    "issue": ["github-pm"],
+    "github": ["github-pm"],
+    # Screen recording
+    "錄": ["screen-record"],
+    "錄影": ["screen-record"],
+    "錄製": ["screen-record"],
 }
 
 # ── Intent signals: Chinese/English action phrases → skill boosts ──
 # Each entry: (pattern, [skill_names], boost_score)
-# Patterns are checked as substrings against the full query.
+# Patterns are checked as substrings against the full query (case-insensitive).
 INTENT_SIGNALS = [
     # Writing/content
     ("寫文章", ["content-writer"], 6),
@@ -97,11 +126,16 @@ INTENT_SIGNALS = [
     ("write an article", ["content-writer"], 6),
     ("blog post", ["content-writer"], 6),
     ("文章", ["content-writer"], 4),
+    ("行銷郵件", ["content-writer"], 8),
+    ("行銷信", ["content-writer"], 6),
+    ("marketing email", ["content-writer"], 6),
     # Presentation
     ("做簡報", ["pptx"], 6),
     ("做ppt", ["pptx"], 8),
     ("make slides", ["pptx"], 6),
-    ("做投影片", ["pptx"], 6),
+    ("做投影片", ["pptx"], 8),
+    ("投影片報告", ["pptx"], 8),
+    ("投影片", ["pptx"], 6),
     # Debugging/monitoring
     ("壞了", ["systematic-debugging", "sentinel"], 6),
     ("出錯", ["systematic-debugging", "four-step-debug"], 6),
@@ -109,12 +143,19 @@ INTENT_SIGNALS = [
     ("health check", ["sentinel"], 6),
     ("服務狀態", ["sentinel"], 6),
     ("掛了", ["sentinel", "systematic-debugging"], 6),
+    ("有bug", ["systematic-debugging", "four-step-debug"], 8),
+    ("有 bug", ["systematic-debugging", "four-step-debug"], 8),
+    ("程式碼有", ["systematic-debugging"], 4),
+    ("bug", ["systematic-debugging", "four-step-debug"], 4),
     # Search
     ("查一下", ["smart-search"], 6),
     ("幫我找", ["smart-search"], 6),
     ("搜一下", ["smart-search"], 6),
     ("look up", ["smart-search"], 4),
     ("research", ["smart-search"], 4),
+    ("想知道", ["smart-search"], 6),
+    ("怎麼用", ["smart-search"], 6),
+    ("claude api", ["smart-search"], 12),
     # Memory
     ("以後都", ["memvault"], 4),
     ("永遠", ["memvault"], 4),
@@ -126,22 +167,28 @@ INTENT_SIGNALS = [
     ("定期", ["scheduler"], 6),
     ("every day", ["scheduler"], 4),
     ("every hour", ["scheduler"], 4),
+    ("每小時", ["scheduler"], 6),
+    ("cron job", ["scheduler"], 8),
+    ("cron", ["scheduler"], 4),
     # Skill management
     ("optimize", ["skill-optimizer"], 6),
     ("優化 skill", ["skill-optimizer"], 6),
     ("improve skill", ["skill-optimizer"], 6),
     ("audit skill", ["skill-optimizer"], 4),
-    # Brainstorming (boost to compete with design skills)
+    # Brainstorming
     ("brainstorm", ["brainstorming"], 8),
     ("腦力激盪", ["brainstorming"], 6),
     ("想一下", ["brainstorming"], 4),
     ("想想", ["brainstorming"], 4),
-    # Monitoring (boost sentinel for infra keywords)
+    # Monitoring
     ("health", ["sentinel"], 4),
     ("monitor", ["sentinel"], 4),
     ("deploy", ["sentinel"], 3),
     ("uptime", ["sentinel"], 4),
     ("服務", ["sentinel"], 3),
+    ("系統效能", ["system-monitor"], 8),
+    ("效能", ["system-monitor"], 4),
+    ("system performance", ["system-monitor"], 6),
     # Frontend / landing page
     ("landing page", ["frontend-design"], 8),
     ("做網頁", ["frontend-design"], 6),
@@ -164,6 +211,52 @@ INTENT_SIGNALS = [
     ("edit video", ["video-edit"], 6),
     ("trim video", ["video-edit"], 6),
     ("影片剪", ["video-edit"], 6),
+    # STT / TTS direction-specific (critical: prevents stt↔tts confusion)
+    # High boosts needed to overcome shared CJK token overlap between stt/tts
+    ("音檔轉成文字", ["stt"], 15),
+    ("轉成文字", ["stt"], 12),
+    ("轉文字", ["stt"], 10),
+    ("語音轉文字", ["stt"], 15),
+    ("音轉文", ["stt"], 10),
+    ("speech to text", ["stt"], 10),
+    ("transcribe", ["stt"], 8),
+    ("transcription", ["stt"], 8),
+    ("文字轉語音", ["tts"], 15),
+    ("轉成語音", ["tts"], 12),
+    ("轉語音", ["tts"], 10),
+    ("文轉音", ["tts"], 10),
+    ("text to speech", ["tts"], 10),
+    # Docs / API docs
+    ("api文件", ["docs-butler"], 8),
+    ("文件更新", ["docs-butler"], 6),
+    ("文件太舊", ["docs-butler"], 8),
+    ("更新文件", ["docs-butler"], 6),
+    ("update docs", ["docs-butler"], 6),
+    ("update documentation", ["docs-butler"], 6),
+    # Quote building
+    ("做報價", ["quote-builder"], 8),
+    ("做個報價", ["quote-builder"], 8),
+    ("報價單", ["quote-builder"], 8),
+    ("build quote", ["quote-builder"], 6),
+    ("make a quote", ["quote-builder"], 6),
+    # GitHub PM
+    ("開issue", ["github-pm"], 8),
+    ("開 issue", ["github-pm"], 8),
+    ("github issue", ["github-pm"], 8),
+    ("new issue", ["github-pm"], 6),
+    ("建立issue", ["github-pm"], 6),
+    # Screen recording
+    ("錄影", ["screen-record"], 6),
+    ("錄操作", ["screen-record"], 8),
+    ("示範影片", ["screen-record"], 8),
+    ("操作示範", ["screen-record"], 8),
+    ("screen record", ["screen-record"], 6),
+    ("錄一段", ["screen-record"], 6),
+    # Social content / image gen
+    ("社群媒體", ["social-content"], 8),
+    ("social media", ["social-content"], 8),
+    ("社群圖片", ["social-content"], 10),
+    ("社群媒體圖片", ["social-content"], 12),
 ]
 
 # ── CJK noise: common words that pollute matching ──
@@ -223,23 +316,90 @@ def cosine_sim(a: list[float], b: list[float]) -> float:
     return dot / (na * nb) if na and nb else 0.0
 
 
+# ── Score-weighted Fusion (adapted from workshop/qdrant RRF pattern) ──
+
+
+def compute_alpha(max_bm25: float) -> float:
+    """Dynamic alpha based on BM25 confidence.
+
+    High BM25 max → strong intent signal match → trust BM25 more.
+    Low BM25 max → ambiguous query → lean on embedding semantics.
+    """
+    if max_bm25 >= 20:
+        return FUSION_ALPHA_HIGH  # 0.8
+    elif max_bm25 >= 10:
+        return FUSION_ALPHA_MED  # 0.6
+    else:
+        return FUSION_ALPHA_LOW  # 0.4
+
+
+def score_fuse(
+    bm25_ranked: list[tuple[str, float]],
+    embed_ranked: list[tuple[str, float]],
+) -> list[tuple[str, float]]:
+    """Score-weighted fusion — normalize BM25 scores, combine with embedding similarity.
+
+    final(d) = alpha * norm_bm25(d) + (1-alpha) * embed_sim(d)
+    where alpha is dynamically chosen based on BM25 confidence.
+    """
+    if not bm25_ranked and not embed_ranked:
+        return []
+
+    max_bm25 = bm25_ranked[0][1] if bm25_ranked else 1.0
+    alpha = compute_alpha(max_bm25)
+
+    bm25_map = {name: score for name, score in bm25_ranked}
+    embed_map = {name: sim for name, sim in embed_ranked}
+
+    all_names = set(bm25_map.keys()) | set(embed_map.keys())
+    fused = []
+    for name in all_names:
+        bm25_norm = bm25_map.get(name, 0) / max_bm25 if max_bm25 > 0 else 0
+        embed_sim = embed_map.get(name, 0)
+        score = alpha * bm25_norm + (1 - alpha) * embed_sim
+        fused.append((name, score))
+
+    fused.sort(key=lambda x: -x[1])
+    return fused
+
+
+# ── Tokenizer ──
+
 CJK_RE = re.compile(r"[\u4e00-\u9fff\u3400-\u4dbf]")
 
 
 def tokenize(text: str) -> list[str]:
-    """Tokenize text: split English on spaces, split CJK into chars + bigrams."""
+    """Tokenize text: split English on spaces, split CJK into chars + bigrams.
+
+    Handles mixed CJK+English words (e.g. "幫我做一個diagram") by extracting
+    both CJK chars/bigrams AND English substrings from the same token.
+    """
     lower = text.lower()
     tokens = []
     for w in re.split(r"[^a-z0-9\u4e00-\u9fff\u3400-\u4dbf]+", lower):
         if not w:
             continue
-        cjk_chars = [c for c in w if CJK_RE.match(c)]
+        # Split mixed word into CJK runs and English runs
+        cjk_chars = []
+        eng_buf = []
+        for c in w:
+            if CJK_RE.match(c):
+                if eng_buf:
+                    eng = "".join(eng_buf)
+                    if eng:
+                        tokens.append(eng)
+                    eng_buf = []
+                cjk_chars.append(c)
+            else:
+                eng_buf.append(c)
+        if eng_buf:
+            eng = "".join(eng_buf)
+            if eng:
+                tokens.append(eng)
         if cjk_chars:
             tokens.extend(cjk_chars)
             for i in range(len(cjk_chars) - 1):
                 tokens.append(cjk_chars[i] + cjk_chars[i + 1])
-        else:
-            tokens.append(w)
     return tokens
 
 
@@ -275,6 +435,9 @@ def cjk_overlap_score(query_cjk: str, target_cjk: str) -> float:
     return len(intersection) / min(len(q_set), len(t_set))
 
 
+# ── BM25 scoring ──
+
+
 def score_skill(skill: dict, query: str, query_tokens: list[str]) -> float:
     query_lower = query.lower().strip()
     score = 0.0
@@ -304,13 +467,11 @@ def score_skill(skill: dict, query: str, query_tokens: list[str]) -> float:
     if name_lower == query_lower or name_lower in query_lower:
         score += 8
     elif name_lower in tokens:
-        # Alias-expanded token matches name exactly (e.g., "pptx" from "ppt")
         score += 8
     elif any(t == name_lower for t in tokens):
         score += 6
 
     # 3. Name component match (split by "-")
-    # "diagram" matches "diagram-gen", "brainstorm" prefix-matches "brainstorming"
     name_parts = name_lower.replace("-", " ").split()
     for token in clean_tokens:
         if len(token) >= 3:
@@ -334,14 +495,13 @@ def score_skill(skill: dict, query: str, query_tokens: list[str]) -> float:
             score += 1.5
 
     # 6. Prefix/stem match on trigger words
-    # "brainstorm" matches trigger word "brainstorming"
     trigger_words = set(trigger_text.split())
     for token in clean_tokens:
         if len(token) >= 4:
             for tw in trigger_words:
                 if tw != token and (tw.startswith(token) or token.startswith(tw)):
                     score += 3
-                    break  # one match per token
+                    break
 
     # 7. Domain match
     if domain and any(t == domain.lower() for t in clean_tokens):
@@ -359,7 +519,6 @@ def score_skill(skill: dict, query: str, query_tokens: list[str]) -> float:
 
     # 10. CJK character overlap
     query_cjk = extract_cjk(query_lower)
-    # Strip noise characters from CJK query
     noise_chars = set()
     for noise in CJK_NOISE:
         noise_chars.update(noise)
@@ -379,51 +538,71 @@ def score_skill(skill: dict, query: str, query_tokens: list[str]) -> float:
     return round(score, 1)
 
 
+# ── Main matching engine ──
+
+
 def match(
     query: str, top_n: int = 3, cold_only: bool = False, no_embed: bool = False
 ) -> list[dict]:
+    """Hybrid BM25 + Embedding matching with RRF fusion."""
     index = load_index()
     hot_skills = load_hot_skills()
     tokens = tokenize(query)
 
-    # Embedding: compute query vector once, then score all skills
-    embed_scores: dict[str, float] = {}
+    # Phase 1: BM25 scoring for all skills
+    skill_map: dict[str, dict] = {}
+    bm25_ranked: list[tuple[str, float]] = []
+    for skill in index:
+        name = skill["name"]
+        if cold_only and name in hot_skills:
+            continue
+        score = score_skill(skill, query, tokens)
+        skill_map[name] = skill
+        if score > 0:
+            bm25_ranked.append((name, score))
+    bm25_ranked.sort(key=lambda x: -x[1])
+
+    # Phase 2: Embedding scoring
+    embed_ranked: list[tuple[str, float]] = []
     if not no_embed:
         skill_embeds = load_embeddings()
         if skill_embeds:
             q_vec = embed_query(query)
             if q_vec:
                 for name, s_vec in skill_embeds.items():
+                    if cold_only and name in hot_skills:
+                        continue
                     sim = cosine_sim(q_vec, s_vec)
                     if sim >= EMBED_THRESHOLD:
-                        embed_scores[name] = round(
-                            (sim - EMBED_THRESHOLD)
-                            / (1.0 - EMBED_THRESHOLD)
-                            * EMBED_WEIGHT,
-                            1,
-                        )
+                        embed_ranked.append((name, sim))
+                embed_ranked.sort(key=lambda x: -x[1])
 
+    # Phase 3: Score-weighted fusion or BM25-only fallback
+    if embed_ranked:
+        fused = score_fuse(bm25_ranked, embed_ranked)
+        ranking = [name for name, _ in fused[:top_n]]
+    else:
+        ranking = [name for name, _ in bm25_ranked[:top_n]]
+
+    # Build output with both scores for transparency
+    bm25_map = dict(bm25_ranked)
+    embed_map = dict(embed_ranked)
     results = []
-    for skill in index:
-        name = skill["name"]
-        if cold_only and name in hot_skills:
+    for name in ranking:
+        skill = skill_map.get(name)
+        if not skill:
             continue
-        bm25 = score_skill(skill, query, tokens)
-        emb = embed_scores.get(name, 0.0)
-        total = round(bm25 + emb, 1)
-        if total > 0:
-            entry = {
-                "name": name,
-                "score": total,
-                "description": skill.get("description", "")[:150],
-                "is_hot": name in hot_skills,
-            }
-            if emb > 0:
-                entry["embed_boost"] = emb
-            results.append(entry)
+        entry = {
+            "name": name,
+            "score": round(bm25_map.get(name, 0), 1),
+            "description": skill.get("description", "")[:150],
+            "is_hot": name in hot_skills,
+        }
+        if name in embed_map:
+            entry["embed_sim"] = round(embed_map[name], 4)
+        results.append(entry)
 
-    results.sort(key=lambda x: -x["score"])
-    return results[:top_n]
+    return results
 
 
 def main():
