@@ -3,13 +3,14 @@
 Apply/restore cold skill descriptions.
 
 Usage:
-    apply_cold.py apply              # Strip cold skill descriptions
+    apply_cold.py apply              # Compact cold skill descriptions
     apply_cold.py restore [name]     # Restore via git checkout (all or one)
     apply_cold.py status             # Show current state
     apply_cold.py diff               # Show what would change
 
 How it works:
-- 'apply' replaces the description field in cold skills' SKILL.md with an empty string
+- 'apply' replaces verbose descriptions with a short name-derived summary
+  (compatible with Claude Code, Gemini CLI, and Codex CLI)
 - Full descriptions are always recoverable via 'restore' (git checkout)
 - Hot skills are never touched
 """
@@ -58,12 +59,21 @@ def get_description_from_frontmatter(content: str) -> str | None:
     return desc.strip().strip('"') if in_desc or desc else desc.strip().strip('"')
 
 
-def strip_description(content: str) -> str:
-    """Replace description field with empty string in YAML frontmatter."""
+def _name_to_short_desc(name: str) -> str:
+    """Convert skill name to short Codex-compatible description."""
+    return name.replace("-", " ").replace("_", " ").title()
+
+
+def strip_description(content: str, skill_name: str = "") -> str:
+    """Replace description with short name-derived summary in YAML frontmatter.
+
+    Uses skill name as minimal description instead of "" for Codex CLI compatibility.
+    """
     match = re.match(r"^---\s*\n(.*?)\n---", content, re.DOTALL)
     if not match:
         return content
 
+    short_desc = _name_to_short_desc(skill_name) if skill_name else "skill"
     fm = match.group(1)
     lines = fm.split("\n")
     new_lines = []
@@ -71,12 +81,8 @@ def strip_description(content: str) -> str:
 
     for line in lines:
         if line.startswith("description:"):
-            new_lines.append('description: ""')
+            new_lines.append(f'description: "{short_desc}"')
             in_desc = True
-            # Check if it's a single-line description
-            val = line.split(":", 1)[1].strip()
-            if val and val != ">-" and val != '""':
-                in_desc = False  # Single line, already replaced
         elif in_desc and (line.startswith("  ") or line.startswith("\t")):
             continue  # Skip multiline description continuation
         else:
@@ -118,7 +124,8 @@ def apply_cold(dry_run: bool = False) -> dict:
             stats["skipped_no_desc"] += 1
             continue
 
-        if desc == "" or desc == '""':
+        expected_short = _name_to_short_desc(d.name)
+        if desc == expected_short:
             stats["skipped_already"] += 1
             continue
 
@@ -126,7 +133,7 @@ def apply_cold(dry_run: bool = False) -> dict:
         backup[d.name] = desc
 
         if not dry_run:
-            new_content = strip_description(content)
+            new_content = strip_description(content, skill_name=d.name)
             skill_md.write_text(new_content)
 
         stats["stripped"] += 1
@@ -221,9 +228,10 @@ def show_status():
         content = skill_md.read_text()
         desc = get_description_from_frontmatter(content)
 
+        expected_short = _name_to_short_desc(d.name)
         if d.name in hot_skills:
             hot += 1
-        elif desc == "" or desc == '""' or desc is None:
+        elif desc == "" or desc == '""' or desc is None or desc == expected_short:
             cold_stripped += 1
         else:
             cold_full += 1

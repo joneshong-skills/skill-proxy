@@ -1,8 +1,15 @@
 ---
 name: skill-proxy
-description: ""
+description: "Skill Proxy"
 version: "1.0"
 tags: meta, proxy, skill-discovery
+io:
+  input:
+    - mime: "text/plain"
+      description: "Skill invocation to proxy"
+  output:
+    - mime: "text/markdown"
+      description: "Proxied skill execution result"
 ---
 
 # Skill Proxy
