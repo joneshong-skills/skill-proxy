@@ -96,6 +96,12 @@ def strip_description(content: str, skill_name: str = "") -> str:
 def apply_cold(dry_run: bool = False) -> dict:
     """Strip descriptions from cold skills. Returns stats."""
     hot_skills = load_hot_skills()
+    # Fail-closed: 空白名單會把所有 skill（含高頻 hot）全部 strip，屬災難性操作。
+    if not hot_skills:
+        raise SystemExit(
+            "ABORT: hot-skills.json 不存在或為空 — apply 會 cold 化全部 skill。"
+            "先建立 hot 白名單再執行。"
+        )
     stats = {
         "stripped": 0,
         "skipped_hot": 0,
@@ -188,17 +194,26 @@ def restore(skill_name: str | None = None) -> dict:
             if result.returncode == 0:
                 stats["restored"] += 1
             else:
-                # Fallback: try from backup
+                # Fallback: regex-replace the CURRENT description (name-title
+                # placeholder OR empty) with the backed-up full one. The old code
+                # looked for literal 'description: ""' but apply writes a name-title
+                # ("Anvil"), so the replace was a no-op yet still reported success.
                 if BACKUP_DIR.exists():
                     backup = json.loads(BACKUP_DIR.read_text())
                     if d.name in backup:
                         content = skill_md.read_text()
-                        # Replace empty description with backup
-                        content = content.replace(
-                            'description: ""', f"description: >-\n  {backup[d.name]}"
+                        new_content = re.sub(
+                            r"^description:.*(?:\n[ \t]+.*)*",
+                            lambda m: "description: >-\n  " + backup[d.name],
+                            content,
+                            count=1,
+                            flags=re.M,
                         )
-                        skill_md.write_text(content)
-                        stats["restored"] += 1
+                        if new_content != content:  # only count if it actually changed
+                            skill_md.write_text(new_content)
+                            stats["restored"] += 1
+                        else:
+                            stats["errors"] += 1
                     else:
                         stats["errors"] += 1
                 else:
@@ -210,7 +225,7 @@ def restore(skill_name: str | None = None) -> dict:
 
 
 def show_status():
-    """Show current cold/hot state."""
+    """Show current tier state (Method-C: core full desc + long-tail keyword lists)."""
     hot_skills = load_hot_skills()
     total = 0
     hot = 0
@@ -236,15 +251,16 @@ def show_status():
         else:
             cold_full += 1
 
-    print(f"Total skills:       {total}")
-    print(f"Hot (full desc):    {hot}")
-    print(f"Cold (stripped):    {cold_stripped}")
-    print(f"Cold (still full):  {cold_full}")
-
-    if cold_full > 0:
-        print(f"\nRun 'apply_cold.py apply' to strip {cold_full} cold skill descriptions")
+    print(f"Total skills:          {total}")
+    print(f"Core (full desc):      {hot}")
+    print(f"Long-tail (keyword):   {cold_full}")
+    if cold_stripped > 0:
+        print(
+            f"Legacy name-title:     {cold_stripped}  "
+            "← run compress_descriptions.py --apply to convert these to keyword lists"
+        )
     else:
-        print("\nAll cold skills are stripped.")
+        print("\nMethod-C: core full desc + long-tail keyword lists (no legacy name-title strips).")
 
 
 def main():

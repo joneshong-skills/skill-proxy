@@ -53,7 +53,7 @@ OMLX_PYTHON = Path.home() / ".venvs/omlx/bin/python3"
 OMLX_WORKER = Path.home() / ".venvs/omlx/embed_worker.py"
 
 # Embedding config
-EMBED_THRESHOLD = 0.45  # minimum cosine similarity to contribute
+EMBED_THRESHOLD = 0.38  # lowered from 0.45 — let semantic recall surface long-tail (diagram-gen ~0.65 / memvault ~0.61 were being cut)
 
 # Score-weighted fusion config (adapted from workshop/qdrant RRF pattern)
 # Dynamic alpha: high BM25 confidence → trust BM25 more; low → lean on embedding
@@ -74,15 +74,12 @@ ALIASES = {
     "試算表": ["xlsx"],
     # Action synonyms
     "brainstorm": ["brainstorming"],
-    "debug": ["systematic-debugging", "four-step-debug"],
+    "debug": ["systematic-debugging"],  # four-step-debug archived → systematic-debugging absorbs it
     "search": ["smart-search"],
     "搜尋": ["smart-search"],
     "搜索": ["smart-search"],
     "查": ["smart-search"],
-    "排程": ["scheduler"],
-    "排班": ["scheduler"],
-    "cron": ["scheduler"],
-    "cronicle": ["scheduler"],
+    # (scheduler aliases removed — scheduler archived 2026-06-05, no live replacement)
     "記住": ["memvault"],
     "記得": ["memvault"],
     "diagram": ["diagram-gen"],
@@ -110,10 +107,7 @@ ALIASES = {
     # GitHub
     "issue": ["github-pm"],
     "github": ["github-pm"],
-    # Screen recording
-    "錄": ["screen-record"],
-    "錄影": ["screen-record"],
-    "錄製": ["screen-record"],
+    # (screen-record aliases removed — archived under-development stub, no live replacement)
 }
 
 # ── Intent signals: Chinese/English action phrases → skill boosts ──
@@ -140,15 +134,15 @@ INTENT_SIGNALS = [
     ("投影片", ["pptx"], 6),
     # Debugging/monitoring
     ("壞了", ["systematic-debugging", "sentinel"], 6),
-    ("出錯", ["systematic-debugging", "four-step-debug"], 6),
-    ("error", ["systematic-debugging", "four-step-debug"], 4),
+    ("出錯", ["systematic-debugging"], 6),
+    ("error", ["systematic-debugging"], 4),
     ("health check", ["sentinel"], 6),
     ("服務狀態", ["sentinel"], 6),
     ("掛了", ["sentinel", "systematic-debugging"], 6),
-    ("有bug", ["systematic-debugging", "four-step-debug"], 8),
-    ("有 bug", ["systematic-debugging", "four-step-debug"], 8),
+    ("有bug", ["systematic-debugging"], 8),
+    ("有 bug", ["systematic-debugging"], 8),
     ("程式碼有", ["systematic-debugging"], 4),
-    ("bug", ["systematic-debugging", "four-step-debug"], 4),
+    ("bug", ["systematic-debugging"], 4),
     # Search
     ("查一下", ["smart-search"], 6),
     ("幫我找", ["smart-search"], 6),
@@ -163,15 +157,7 @@ INTENT_SIGNALS = [
     ("永遠", ["memvault"], 4),
     ("always use", ["memvault"], 4),
     ("never use", ["memvault"], 4),
-    # Scheduling
-    ("每天", ["scheduler"], 4),
-    ("定時", ["scheduler"], 6),
-    ("定期", ["scheduler"], 6),
-    ("every day", ["scheduler"], 4),
-    ("every hour", ["scheduler"], 4),
-    ("每小時", ["scheduler"], 6),
-    ("cron job", ["scheduler"], 8),
-    ("cron", ["scheduler"], 4),
+    # (Scheduling intents removed — scheduler archived 2026-06-05, Cronicle retired, no live skill)
     # Skill management
     ("optimize", ["skill-optimizer"], 6),
     ("優化 skill", ["skill-optimizer"], 6),
@@ -247,13 +233,7 @@ INTENT_SIGNALS = [
     ("github issue", ["github-pm"], 8),
     ("new issue", ["github-pm"], 6),
     ("建立issue", ["github-pm"], 6),
-    # Screen recording
-    ("錄影", ["screen-record"], 6),
-    ("錄操作", ["screen-record"], 8),
-    ("示範影片", ["screen-record"], 8),
-    ("操作示範", ["screen-record"], 8),
-    ("screen record", ["screen-record"], 6),
-    ("錄一段", ["screen-record"], 6),
+    # (Screen-recording intents removed — screen-record archived under-dev stub, no live skill)
     # Social content / image gen
     ("社群媒體", ["social-content"], 8),
     ("social media", ["social-content"], 8),
@@ -520,9 +500,7 @@ def score_skill(skill: dict, query: str, query_tokens: list[str]) -> float:
             for part in name_parts:
                 if part == token:
                     score += 5
-                elif len(token) >= 4 and (
-                    part.startswith(token) or token.startswith(part)
-                ):
+                elif len(token) >= 4 and (part.startswith(token) or token.startswith(part)):
                     score += 3
 
     # 4. Description keyword match
@@ -583,12 +561,9 @@ def score_skill(skill: dict, query: str, query_tokens: list[str]) -> float:
 # ── Main matching engine ──
 
 
-def match(
-    query: str, top_n: int = 3, cold_only: bool = False, no_embed: bool = False
-) -> list[dict]:
-    """Hybrid BM25 + Embedding matching with RRF fusion."""
+def match(query: str, top_n: int = 3, no_embed: bool = False) -> list[dict]:
+    """Hybrid BM25 + Embedding matching with score-weighted fusion."""
     index = load_index()
-    hot_skills = load_hot_skills()
     tokens = tokenize(query)
 
     # Phase 1: BM25 scoring for all skills
@@ -596,8 +571,6 @@ def match(
     bm25_ranked: list[tuple[str, float]] = []
     for skill in index:
         name = skill["name"]
-        if cold_only and name in hot_skills:
-            continue
         score = score_skill(skill, query, tokens)
         skill_map[name] = skill
         if score > 0:
@@ -612,8 +585,6 @@ def match(
             q_vec = embed_query(query)
             if q_vec:
                 for name, s_vec in skill_embeds.items():
-                    if cold_only and name in hot_skills:
-                        continue
                     sim = cosine_sim(q_vec, s_vec)
                     if sim >= EMBED_THRESHOLD:
                         embed_ranked.append((name, sim))
@@ -638,7 +609,6 @@ def match(
             "name": name,
             "score": round(bm25_map.get(name, 0), 1),
             "description": skill.get("description", "")[:150],
-            "is_hot": name in hot_skills,
         }
         if name in embed_map:
             entry["embed_sim"] = round(embed_map[name], 4)

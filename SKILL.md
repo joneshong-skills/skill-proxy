@@ -1,6 +1,10 @@
 ---
 name: skill-proxy
-description: "Skill Proxy"
+description: >-
+  Use when the user asks "is there a skill for X?", "find a skill that can", "有沒有 skill 可以",
+  "搜尋 skill", "find cold skill", "skill 搜尋", or when a user request doesn't match any
+  loaded skill description. This skill searches the BM25 skill index to discover and invoke
+  cold skills whose descriptions have been stripped from the system prompt to save tokens.
 version: "1.0"
 tags: meta, proxy, skill-discovery
 io:
