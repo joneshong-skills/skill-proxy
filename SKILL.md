@@ -5,6 +5,8 @@ description: >-
   "搜尋 skill", "find cold skill", "skill 搜尋", or when a user request doesn't match any
   loaded skill description. This skill searches the BM25 skill index to discover and invoke
   cold skills whose descriptions have been stripped from the system prompt to save tokens.
+  Listing what is installed is /skill-catalog; how skills combine is /skill-graph; checking
+  one still runs is /skill-tester.
 version: "1.0"
 tags: meta, proxy, skill-discovery
 io:
