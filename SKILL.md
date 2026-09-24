@@ -63,7 +63,8 @@ Skill(skill: "matched-skill-name", args: "original user request")
 # Strip cold skill descriptions (apply compression)
 ~/.local/bin/python3 ~/.claude/skills/skill-proxy/scripts/apply_cold.py apply
 
-# Restore all descriptions (before editing/publishing skills)
+# Restore all descriptions (before editing/publishing skills).
+# restore runs `git checkout -- SKILL.md` in each skill repo: uncommitted SKILL.md edits are discarded — commit them first.
 ~/.local/bin/python3 ~/.claude/skills/skill-proxy/scripts/apply_cold.py restore
 
 # Restore single skill
@@ -85,8 +86,8 @@ Skill(skill: "matched-skill-name", args: "original user request")
 └── skill-proxy/SKILL.md     ← This skill: search index + management
 
 ~/.claude/data/skill-index/
-├── triggers.json            ← Search index (81+ skills, triggers/domain/tags)
-├── hot-skills.json          ← List of 20 hot skill names
+├── triggers.json            ← Search index (triggers/domain/tags; count via `match_skill.py --stats`)
+├── hot-skills.json          ← Hot skill names (list via `match_skill.py --hot`)
 └── description-backup.json  ← Backup of stripped descriptions
 ```
 
